@@ -75,4 +75,15 @@ describe("Gemini 4 Argon Antigravity tier", () => {
     expect(finalBody.model).toBe(modelId);
     expect(finalBody.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: expectedLevel, includeThoughts: true });
   });
+
+  it("returns a clear diagnostic error message when upstream returns 404 for Argon", () => {
+    const exec = new AntigravityExecutor();
+    exec.transformRequest("gemini-4-argon-medium", { request: {} }, true, {});
+    const err = exec.parseError(
+      { status: 404 },
+      JSON.stringify({ error: { code: 404, message: "Requested entity was not found." } })
+    );
+    expect(err.status).toBe(404);
+    expect(err.message).toContain("Google restricts Argon to Ultra and paid Pro plan subscribers on Antigravity");
+  });
 });

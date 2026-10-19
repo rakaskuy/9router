@@ -147,6 +147,12 @@ export class AntigravityExecutor extends BaseExecutor {
         }
       } catch { /* fall through to default */ }
     }
+    if (response.status === 404 && /gemini-4-argon/i.test(this._lastModel || "")) {
+      return {
+        status: 404,
+        message: "Gemini 4 Argon is unavailable for this account: Google restricts Argon to Ultra and paid Pro plan subscribers on Antigravity.",
+      };
+    }
     return super.parseError(response, bodyText);
   }
 
@@ -170,6 +176,7 @@ export class AntigravityExecutor extends BaseExecutor {
   }
 
   transformRequest(model, body, stream, credentials) {
+    this._lastModel = model;
     const projectId = credentials?.projectId || this.generateProjectId();
 
     // OpenAI clients may include stream_options even for non-streaming calls.
