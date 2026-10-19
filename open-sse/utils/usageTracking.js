@@ -53,6 +53,13 @@ export function addBufferToUsage(usage) {
     result.total_tokens = result.prompt_tokens + result.completion_tokens;
   }
 
+  if (result.prompt_tokens_details && typeof result.prompt_tokens_details === "object") {
+    result.prompt_tokens_details = { ...result.prompt_tokens_details };
+  }
+  if (result.completion_tokens_details && typeof result.completion_tokens_details === "object") {
+    result.completion_tokens_details = { ...result.completion_tokens_details };
+  }
+
   return result;
 }
 
@@ -248,7 +255,12 @@ export function extractUsage(chunk) {
       prompt_tokens: u.input_tokens || 0,
       completion_tokens: u.output_tokens || 0,
       cache_read_input_tokens: u.cache_read_input_tokens,
-      cache_creation_input_tokens: u.cache_creation_input_tokens
+      cache_creation_input_tokens: u.cache_creation_input_tokens,
+      cached_tokens: u.cache_read_input_tokens,
+      prompt_tokens_details: (u.cache_read_input_tokens || u.cache_creation_input_tokens) ? {
+        cached_tokens: u.cache_read_input_tokens || 0,
+        cache_creation_tokens: u.cache_creation_input_tokens || 0
+      } : undefined
     });
   }
 
@@ -258,7 +270,12 @@ export function extractUsage(chunk) {
       prompt_tokens: chunk.usage.input_tokens || 0,
       completion_tokens: chunk.usage.output_tokens || 0,
       cache_read_input_tokens: chunk.usage.cache_read_input_tokens,
-      cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens
+      cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens,
+      cached_tokens: chunk.usage.cache_read_input_tokens,
+      prompt_tokens_details: (chunk.usage.cache_read_input_tokens || chunk.usage.cache_creation_input_tokens) ? {
+        cached_tokens: chunk.usage.cache_read_input_tokens || 0,
+        cache_creation_tokens: chunk.usage.cache_creation_input_tokens || 0
+      } : undefined
     });
   }
 

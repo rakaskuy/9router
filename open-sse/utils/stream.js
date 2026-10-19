@@ -81,6 +81,8 @@ export function createSSEStream(options = {}) {
   let sseLineCount = 0;
   let sseEmittedCount = 0;
   const eventTypeCounts = {};
+  let activeToolIndex = null;
+  const seenToolIndices = new Set();
 
   // Track Responses API event framing for same-format passthrough (codex)
   let currentOpenAIResponsesEvent = null;
@@ -198,9 +200,37 @@ export function createSSEStream(options = {}) {
               // causing premature `reasoning-end` on every chunk.
               if (parsed?.choices) {
                 for (const choice of parsed.choices) {
-                  if (choice.delta?.tool_calls && Array.isArray(choice.delta.tool_calls) && choice.delta.tool_calls.length === 0) {
-                    delete choice.delta.tool_calls;
-                    fieldsInjected = true;
+                  if (choice.delta?.tool_calls && Array.isArray(choice.delta.tool_calls)) {
+                    if (choice.delta.tool_calls.length === 0) {
+                      delete choice.delta.tool_calls;
+                      fieldsInjected = true;
+                    } else {
+                      // Normalize tool calls: restore aliases and ensure index/id integrity (#4992, #4986)
+                      for (let i = 0; i < choice.delta.tool_calls.length; i++) {
+                        const tc = choice.delta.tool_calls[i];
+                        if (!tc || typeof tc !== "object") continue;
+
+                        if (toolNameMap && toolNameMap.size > 0 && tc.function?.name && toolNameMap.has(tc.function.name)) {
+                          tc.function.name = toolNameMap.get(tc.function.name);
+                          fieldsInjected = true;
+                        }
+
+                        if (tc.index === undefined || tc.index === null) {
+                          tc.index = activeToolIndex !== null ? activeToolIndex : i;
+                          fieldsInjected = true;
+                        } else {
+                          activeToolIndex = tc.index;
+                        }
+
+                        if (tc.index !== undefined && !seenToolIndices.has(tc.index)) {
+                          if (!tc.id) {
+                            tc.id = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+                            fieldsInjected = true;
+                          }
+                          seenToolIndices.add(tc.index);
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -397,7 +427,14 @@ export function createSSEStream(options = {}) {
             } else if (state.finishReason && isFinishChunk && state.usage) {
               // Add buffer and filter usage for client (but keep original in state.usage for logging)
               const buffered = addBufferToUsage(state.usage);
-              item.usage = filterUsageForFormat(buffered, sourceFormat);
+              const filtered = filterUsageForFormat(buffered, sourceFormat);
+              if (item.usage?.prompt_tokens_details && !filtered.prompt_tokens_details) {
+                filtered.prompt_tokens_details = item.usage.prompt_tokens_details;
+              }
+              if (item.usage?.completion_tokens_details && !filtered.completion_tokens_details) {
+                filtered.completion_tokens_details = item.usage.completion_tokens_details;
+              }
+              item.usage = filtered;
             }
 
             const output = formatSSE(item, sourceFormat);
@@ -553,7 +590,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, toolNameMap = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
     provider,
@@ -562,6 +599,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
     connectionId,
     body,
     onStreamComplete,
-    apiKey
+    apiKey,
+    toolNameMap
   });
 }
