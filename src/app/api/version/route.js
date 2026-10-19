@@ -53,7 +53,8 @@ async function getLatestVersionCached() {
 }
 
 export async function GET() {
-  const latestVersion = await getLatestVersionCached();
+  const latestVersion =
+    process.env.NINEROUTER_SKIP_UPDATE === "1" ? null : await getLatestVersionCached();
   const currentVersion = pkg.version;
   const hasUpdate = latestVersion ? compareVersions(latestVersion, currentVersion) > 0 : false;
 

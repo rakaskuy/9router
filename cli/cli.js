@@ -65,6 +65,7 @@ function createSpinner(text) {
 const pkg = require("./package.json");
 const { ensureSqliteRuntime, buildEnvWithRuntime } = require("./hooks/sqliteRuntime");
 const { ensureTrayRuntime } = require("./hooks/trayRuntime");
+const { buildServerEnv } = require("./src/cli/serverEnv");
 const args = process.argv.slice(2);
 
 // Subcommands (`9router xai video …`) run against an already-running gateway
@@ -635,11 +636,12 @@ function startServer(updatePromise) {
       stdio: showLog ? "inherit" : ["ignore", "ignore", "pipe"],
       detached: true,
       windowsHide: true,
-      env: {
-        ...buildEnvWithRuntime(process.env),
-        PORT: port.toString(),
-        HOSTNAME: host
-      }
+      env: buildServerEnv({
+        baseEnv: buildEnvWithRuntime(process.env),
+        port,
+        host,
+        skipUpdate
+      })
     });
     if (!showLog && child.stderr) {
       child.stderr.on("data", (data) => {
