@@ -121,6 +121,83 @@ describe("opencodeFingerprint — request side", () => {
   });
 });
 
+describe("opencodeFingerprint — in-place normalization", () => {
+  const shellTool = (os, shell, name = "shell") => ({
+    type: "function",
+    name,
+    description:
+      "Execute a shell command and return its output. Commands run on " + os + " using " + shell + ". Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "Shell command string to execute" },
+        workdir: { type: "string", description: "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead." },
+        timeout: { type: "integer", minimum: 0, description: "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default." },
+        background: { type: "boolean", description: "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion." },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  });
+
+  const asChat = (tool) => ({
+    type: tool.type,
+    function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+  });
+  const windowsShell = () => shellTool("Windows", "pwsh");
+
+  it("keeps the caller's name and adopts OpenCode's definition when arguments line up", () => {
+    const body = { tools: [windowsShell(), { type: "function", name: "Edit" }] };
+    const map = applyFingerprintTools(body, true);
+
+    expect(body.tools.map((t) => t.name)).toEqual(["shell", "Edit", "read"]);
+    expect(map.size).toBe(0);
+    expect(takeRenamedToolNames(body)).toBeNull();
+    expect(body.tools[0].description).toContain("Commands run on Linux using bash.");
+    expect(body.tools[0].parameters.required).toEqual(["command"]);
+    expect(body.instructions).toBe("Do not call the `read` tool; it is a placeholder that does nothing. Use the other tools you have been given instead.");
+  });
+
+  it("normalizes the nested chat shape without adding a system note", () => {
+    const body = { tools: [asChat(windowsShell())] };
+    const map = applyFingerprintTools(body, false);
+
+    expect(body.tools.map((t) => t.function.name)).toEqual(["shell", "read"]);
+    expect(map.size).toBe(0);
+    expect(body.messages).toBeUndefined();
+    expect(body.tools[0].function.description).toContain("Commands run on Linux using bash.");
+  });
+
+  it("wires a real OpenCode client down to exactly read + shell", () => {
+    const seeded = { tools: [] };
+    applyFingerprintTools(seeded, false);
+    const officialRead = seeded.tools.find((tool) => tool.function?.name === "read");
+
+    const body = { tools: [officialRead, asChat(windowsShell())] };
+    const map = applyFingerprintTools(body, false);
+
+    expect(body.tools.map((t) => t.function.name)).toEqual(["read", "shell"]);
+    expect(map.size).toBe(0);
+    expect(body.messages).toBeUndefined();
+  });
+
+  it("still conceals a fingerprint name whose arguments do not line up", () => {
+    const body = {
+      tools: [{
+        type: "function",
+        name: "shell",
+        description: "Run a command",
+        parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] },
+      }],
+    };
+    const map = applyFingerprintTools(body, true);
+
+    expect(body.tools.map((t) => t.name)).toEqual(["shell_client", "read", "shell"]);
+    expect(map.get("shell_client")).toBe("shell");
+    expect(body.instructions).toContain("Do not call the");
+  });
+});
+
 describe("opencodeFingerprint — response side", () => {
   const map = new Map([["bash", "Bash"], ["grep", "Grep"], ["read", "Read"]]);
 
