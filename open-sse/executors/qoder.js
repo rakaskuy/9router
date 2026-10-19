@@ -250,6 +250,17 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
   }
 
   const { messages, systemText } = normalizeMessages(incoming);
+  // Qoder agent endpoint ignores payload.system upstream. Fold systemText into the first user turn (#4995).
+  if (systemText.trim()) {
+    const firstUser = messages.find((m) => m && m.role === "user");
+    if (firstUser) {
+      if (Array.isArray(firstUser.content)) {
+        firstUser.content = [{ type: "text", text: systemText }, ...firstUser.content];
+      } else {
+        firstUser.content = `${systemText}\n\n${typeof firstUser.content === "string" ? firstUser.content : ""}`;
+      }
+    }
+  }
   const tools = body.tools;
   const isReasoning = !!modelConfig.is_reasoning;
   const maxOutputTokens = Number(modelConfig.max_output_tokens) || 0;
