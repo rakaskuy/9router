@@ -102,4 +102,29 @@ describe("CodeBuddy channel verification (error 11128)", () => {
     expect(out.messages[2].content).not.toContain("cc_entrypoint=cli");
     expect(out.messages[2].content).toContain("[external-client-identity]");
   });
+
+  it.each([
+    ["hy3-preview", "hy3"],
+    ["glm-4.7", "glm-5.2"],
+    ["glm-5.0", "glm-5.2"],
+    ["glm-5.0-turbo", "glm-5.3-flash"],
+    ["minimax-m2.7", "minimax-m3"],
+    ["deepseek-v3-2-volc", "deepseek-v4.1-flash"],
+    ["deepseek-v4-pro", "deepseek-v4.1-flash"],
+  ])("automatically remaps retired model '%s' to active successor '%s'", (retired, successor) => {
+    const intlExec = new CodeBuddyIntlExecutor();
+    const out = intlExec.transformRequest(retired, { model: retired, messages: [{ role: "user", content: "test" }] }, true, {});
+    expect(out.model).toBe(successor);
+  });
+
+  it("formats 11102 model service info not found into a diagnostic error", () => {
+    const intlExec = new CodeBuddyIntlExecutor();
+    const err = intlExec.parseError(
+      { status: 400 },
+      JSON.stringify({ code: 11102, msg: "model [hy3-preview] service info not found" })
+    );
+    expect(err.status).toBe(400);
+    expect(err.message).toContain("11102");
+    expect(err.message).toContain("hy3");
+  });
 });

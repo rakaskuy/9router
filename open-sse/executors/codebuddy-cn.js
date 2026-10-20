@@ -45,6 +45,18 @@ function isValidB3TraceId(val) {
   return true;
 }
 
+// Mapping for retired/deprecated model IDs to their active successors upstream
+const CODEBUDDY_RETIRED_MODEL_MAP = {
+  "hy3-preview": "hy3",
+  "glm-4.7": "glm-5.2",
+  "glm-5.0": "glm-5.2",
+  "glm-5.0-turbo": "glm-5.3-flash",
+  "minimax-m2.7": "minimax-m3",
+  "deepseek-v3-2-volc": "deepseek-v4.1-flash",
+  "deepseek-v4-pro": "deepseek-v4.1-flash",
+  "kimi-k3-1": "kimi-k2.8-preview",
+};
+
 /**
  * Tencent CodeBuddy Executor (codebuddy-cn / codebuddy-intl)
  * Uses OpenAI-compatible chat completions API with CodeBuddy CLI channel headers.
@@ -151,6 +163,14 @@ export class CodeBuddyExecutor extends DefaultExecutor {
   transformRequest(model, body, stream, credentials) {
     const nextBody = super.transformRequest(model, body, stream, credentials);
     nextBody.stream = true;
+
+    // Remap retired/deprecated model IDs to active successors
+    if (nextBody.model && CODEBUDDY_RETIRED_MODEL_MAP[nextBody.model]) {
+      nextBody.model = CODEBUDDY_RETIRED_MODEL_MAP[nextBody.model];
+    } else if (model && CODEBUDDY_RETIRED_MODEL_MAP[model]) {
+      nextBody.model = CODEBUDDY_RETIRED_MODEL_MAP[model];
+    }
+
     const effort = nextBody.reasoning_effort;
     if (effort === "none" || effort === "off") {
       delete nextBody.reasoning_effort;
@@ -209,6 +229,12 @@ export class CodeBuddyExecutor extends DefaultExecutor {
       try {
         const parsed = JSON.parse(bodyText);
         const msg = parsed?.msg || parsed?.message || parsed?.error?.message || "";
+        if (parsed?.code === 11102) {
+          return {
+            status: 400,
+            message: `CodeBuddy model unavailable (11102): ${msg}. Please switch to an active model: hy3, hy4-preview, glm-5.3, glm-5.3-flash, glm-5.2, deepseek-v4.1-flash, kimi-k2.8-preview, or claude-opus-4.7-1m.`,
+          };
+        }
         if (parsed?.code === 6004 || /超出频率限制|frequency limit|限额/i.test(msg)) {
           let resetsAtMs = null;
           const match = msg.match(
