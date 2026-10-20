@@ -70,6 +70,17 @@ const args = process.argv.slice(2);
 
 // Subcommands (`9router xai video …`) run against an already-running gateway
 // and bypass the launcher flow (no runtime self-heal, no server spawn).
+if (args[0] === "test-models") {
+  const { run } = require("./src/cli/commands/testModels");
+  run(args.slice(1))
+    .then((code) => process.exit(code || 0))
+    .catch((err) => {
+      console.error(`❌ ${err?.message || err}`);
+      process.exit(1);
+    });
+  return;
+}
+
 if (args[0] === "xai" && args[1] === "video") {
   const { run } = require("./src/cli/commands/xaiVideo");
   run(args.slice(2))
@@ -169,6 +180,8 @@ Options:
   -v, --version       Show version
 
 Commands:
+  test-models <provider> Test all models for a provider via running 9router
+                      (e.g. 9router test-models cbai)
   connect <server-url> Configure Claude Code for a remote 9router server
                       (npx 9router connect http://host:20128 — no install needed)
   show [tool…]        Show each CLI tool's current 9router config and models

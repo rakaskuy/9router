@@ -25,6 +25,7 @@ import BulkImportCodexModal from "./BulkImportCodexModal";
 import BulkImportGrokCliModal from "./BulkImportGrokCliModal";
 import CustomConfigCard from "./CustomConfigCard";
 import AutoPingScheduleModal from "./AutoPingScheduleModal";
+import TestAllModelsModal from "./TestAllModelsModal";
 import { getScheduleSlotLabels } from "@/shared/services/quotaPingSchedule";
 
 const ONE_BY_ONE_DELAY_MS = 1000;
@@ -64,6 +65,9 @@ export default function ProviderDetailPage() {
   const [modelTestResults, setModelTestResults] = useState({});
   const [modelsTestError, setModelsTestError] = useState("");
   const [testingModelIds, setTestingModelIds] = useState(() => new Set());
+  const [testingAllModels, setTestingAllModels] = useState(false);
+  const [testAllModelsResults, setTestAllModelsResults] = useState(null);
+  const [showTestAllModal, setShowTestAllModal] = useState(false);
   const [showAddCustomModel, setShowAddCustomModel] = useState(false);
   const [selectedConnectionIds, setSelectedConnectionIds] = useState([]);
   const [bulkProxyPoolId, setBulkProxyPoolId] = useState("__none__");
@@ -1158,6 +1162,37 @@ export default function ProviderDetailPage() {
     }
   };
 
+  const handleTestAllModels = async () => {
+    if (testingAllModels) return;
+    setTestingAllModels(true);
+    setModelsTestError("");
+    try {
+      const res = await fetch(`/api/providers/${providerId}/test-models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ concurrency: 3 }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setModelsTestError(data.error || "Failed to test models");
+        return;
+      }
+      setTestAllModelsResults(data);
+      if (Array.isArray(data.results)) {
+        const newStatuses = {};
+        for (const r of data.results) {
+          newStatuses[r.modelId] = r.ok ? "ok" : "error";
+        }
+        setModelTestResults((prev) => ({ ...prev, ...newStatuses }));
+      }
+      setShowTestAllModal(true);
+    } catch (err) {
+      setModelsTestError(err.message || "Network error while testing models");
+    } finally {
+      setTestingAllModels(false);
+    }
+  };
+
   const renderModelsSection = () => {
     if (isCompatible) {
       return (
@@ -1777,27 +1812,40 @@ export default function ProviderDetailPage() {
               </select>
             )}
           </div>
-          {!isCompatible && (() => {
-            const allIds = [
-              ...models,
-              ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
-            ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; }).map((m) => m.id);
-            const activeIds = allIds.filter((id) => !disabledModelIds.includes(id));
-            return (
-              <div className="flex gap-2">
-                {disabledModelIds.length > 0 && (
-                  <Button size="sm" variant="secondary" icon="restart_alt" onClick={handleEnableAll}>
-                    Active All
-                  </Button>
-                )}
-                {activeIds.length > 0 && (
-                  <Button size="sm" variant="secondary" icon="block" onClick={() => handleDisableAll(activeIds)}>
-                    Disable All
-                  </Button>
-                )}
-              </div>
-            );
-          })()}
+          <div className="flex flex-wrap items-center gap-2">
+            {(connections.length > 0 || isFreeNoAuth) && (
+              <Button
+                size="sm"
+                variant="secondary"
+                icon={testingAllModels ? "progress_activity" : "science"}
+                disabled={testingAllModels}
+                onClick={handleTestAllModels}
+              >
+                {testingAllModels ? translate("Testing...") : translate("Test All Models")}
+              </Button>
+            )}
+            {!isCompatible && (() => {
+              const allIds = [
+                ...models,
+                ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
+              ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; }).map((m) => m.id);
+              const activeIds = allIds.filter((id) => !disabledModelIds.includes(id));
+              return (
+                <div className="flex gap-2">
+                  {disabledModelIds.length > 0 && (
+                    <Button size="sm" variant="secondary" icon="restart_alt" onClick={handleEnableAll}>
+                      Active All
+                    </Button>
+                  )}
+                  {activeIds.length > 0 && (
+                    <Button size="sm" variant="secondary" icon="block" onClick={() => handleDisableAll(activeIds)}>
+                      Disable All
+                    </Button>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
         </div>
         {!!modelsTestError && (
           <div className="mb-3">
@@ -1984,6 +2032,16 @@ export default function ProviderDetailPage() {
         title={confirmState?.title || "Confirm"}
         message={confirmState?.message}
         variant="danger"
+      />
+
+      {/* Test All Models Modal */}
+      <TestAllModelsModal
+        isOpen={showTestAllModal}
+        onClose={() => setShowTestAllModal(false)}
+        results={testAllModelsResults}
+        providerName={providerInfo?.name || providerId}
+        onRetest={handleTestAllModels}
+        isRetesting={testingAllModels}
       />
     </div>
   );

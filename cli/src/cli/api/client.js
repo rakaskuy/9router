@@ -83,7 +83,7 @@ function configure(options = {}) {
  * @param {Object} body - Request body (optional)
  * @returns {Promise<Object>} Response with { success, data/error }
  */
-function makeRequest(method, path, body = null) {
+function makeRequest(method, path, body = null, timeoutMs = 30000) {
   return new Promise((resolve) => {
     const httpModule = config.protocol === "https:" ? https : http;
     
@@ -153,8 +153,8 @@ function makeRequest(method, path, body = null) {
       });
     });
 
-    // Set timeout (30 seconds)
-    req.setTimeout(30000);
+    // Set timeout
+    req.setTimeout(timeoutMs);
 
     // Write body if present
     if (body && (method === "POST" || method === "PUT" || method === "PATCH")) {
@@ -211,6 +211,16 @@ async function deleteProvider(id) {
  */
 async function getProviderModels(id) {
   return makeRequest("GET", `/api/providers/${id}/models`);
+}
+
+/**
+ * Test all models for a provider or connection
+ * @param {string} id - Provider ID, alias, or connection ID
+ * @param {Object} [data] - { modelIds?: string[], concurrency?: number }
+ * @returns {Promise<Object>} { success, data, statusCode, error }
+ */
+async function testProviderModels(id, data = {}) {
+  return makeRequest("POST", `/api/providers/${encodeURIComponent(id)}/test-models`, data, 180000);
 }
 
 // ============================================================================
@@ -513,6 +523,7 @@ module.exports = {
   getProviders,
   getProviderById,
   testProvider,
+  testProviderModels,
   deleteProvider,
   getProviderModels,
   
