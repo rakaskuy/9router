@@ -1,49 +1,50 @@
-import crypto from "crypto";
 import { DefaultExecutor } from "./default.js";
 import { refreshCodebuddyToken, refreshCodebuddyIntlToken } from "../services/tokenRefresh.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { buddyConversationHeaders } from "../shared/buddy/buddy-conversation-headers.js";
+import { buddyCliHeaders, buddyCliTraceHeaders } from "../shared/buddy/buddy-cli-headers.js";
+import {
+  applyBuddySystemPrompt,
+  buddyPrePayloadCommon,
+  coalesceConsecutiveUserMessages,
+  dropEmptyBuddyMessages,
+  ensureBuddyLeadingSystem,
+} from "../shared/buddy/buddy-chat-shared.js";
 
-const CODEBUDDY_SYSTEM_PROMPT = "You are CodeBuddy Code.";
+/**
+ * Client identity behind the per-request CodeBuddy headers.
+ *
+ * Ported from risunCodex/Cartethyia: the desktop product sends conversation
+ * headers plus browser transport, while the CLI sends the agent envelope plus
+ * the OpenAI Node SDK fingerprint and no browser headers at all. A request
+ * carrying both halves is a hybrid no real client produces, which is what risk
+ * control keys on.
+ */
+const CODEBUDDY_VERSION = "2.169.0";
 
-const CHANNEL_MARKERS = [
-  "You are Claude Code, Anthropic's official CLI for Claude.",
-  "x-anthropic-billing-header",
-  "Main branch (you will usually use this for PRs):",
-];
+/**
+ * Leading system turn for the international variant.
+ *
+ * The upstream validates that the wire *opens* with a `system` turn (code
+ * `11128`) and validates its text: substituting caller text there answers
+ * `11128 "Illegal API invocation from an unapproved channel"`, because it
+ * reads that prompt as the calling channel's identity. So this text is a wire
+ * contract rather than a product choice, and caller `system`/`developer` turns
+ * are dropped rather than merged into it.
+ */
+export const CODEBUDDY_SYSTEM_PROMPT =
+  "You are a pragmatic and direct software engineering assistant. " +
+  "Be honest and truthful: state what you know, say plainly when you are unsure " +
+  "or do not know, and never claim to have done something you have not done. " +
+  "Prefer concrete answers over filler, and say so when a request is ambiguous " +
+  "instead of guessing silently.";
 
-const CHANNEL_MARKER_REGEX =
-  /you are claude code|claude.?code.+official.+cli|anthropic.+official.+cli|anxthxropic.+official.+cli|you are (?:cursor|windsurf|cline|aider|continue|copilot|cody)|cc_entrypoint\s*=\s*(?:cli|vscode|jetbrains|gui)|claude.?code.+issues|give feedback.+claude.?code|OhMyOpenCode/gi;
+/** CN neutralizer — replaces flagged agent prompts, keeps legitimate caller ones. */
+const CODEBUDDY_CN_NEUTRAL_PROMPT =
+  "You are a helpful AI assistant that helps with software engineering tasks.";
 
-function sanitizeChannelMarkers(text) {
-  if (typeof text !== "string" || !text) return text;
-  let result = text;
-  for (const marker of CHANNEL_MARKERS) {
-    if (result.includes(marker)) {
-      result = result.split(marker).join("[external-client-identity]");
-    }
-  }
-  return result.replace(CHANNEL_MARKER_REGEX, "[external-client-identity]");
-}
-
-function getHeaderCaseInsensitive(headers, name) {
-  if (!headers || typeof headers !== "object") return undefined;
-  const target = name.toLowerCase();
-  for (const [key, val] of Object.entries(headers)) {
-    if (key.toLowerCase() === target) {
-      if (Array.isArray(val)) return val[0];
-      return val;
-    }
-  }
-  return undefined;
-}
-
-function isValidB3TraceId(val) {
-  if (typeof val !== "string") return false;
-  const trimmed = val.trim();
-  if (!/^[0-9a-fA-F]{16}$|^[0-9a-fA-F]{32}$/.test(trimmed)) return false;
-  if (/^0+$/.test(trimmed)) return false;
-  return true;
-}
+const CN_AGENT_PATTERN =
+  /you are claude code|claude.?code.+official.+cli|anthropic.+official.+cli|anxthxropic.+official.+cli|you are (?:cursor|windsurf|cline|aider|continue|copilot|cody)|you are an? (?:ai )?(?:coding |code )?agent|cc_entrypoint\s*=\s*(?:cli|vscode|jetbrains|gui)|claude.?code.+issues|give feedback.+claude.?code|you are .{0,30}(?:powerful )?ai agent|orchestration capabilities|OhMyOpenCode|<agent-identity>|<Role>|<Behavior_Instructions>/i;
 
 // Mapping for retired/deprecated model IDs to their active successors upstream
 const CODEBUDDY_RETIRED_MODEL_MAP = {
@@ -57,9 +58,79 @@ const CODEBUDDY_RETIRED_MODEL_MAP = {
   "kimi-k3-1": "kimi-k2.8-preview",
 };
 
+function getHeaderCaseInsensitive(headers, name) {
+  if (!headers || typeof headers !== "object") return undefined;
+  const target = name.toLowerCase();
+  for (const [key, val] of Object.entries(headers)) {
+    if (key.toLowerCase() === target) {
+      if (Array.isArray(val)) return val[0];
+      return val;
+    }
+  }
+  return undefined;
+}
+
+function flattenContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => (part && typeof part === "object" && typeof part.text === "string" ? part.text : ""))
+    .join("\n");
+}
+
+function neutralizeCnMessages(messages) {
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (!message || message.role !== "system") continue;
+    const content = message.content;
+    const text = flattenContent(content);
+    if (text.length <= 2000 && !CN_AGENT_PATTERN.test(text)) continue;
+    messages[index] =
+      typeof content === "string"
+        ? { ...message, content: CODEBUDDY_CN_NEUTRAL_PROMPT }
+        : { ...message, content: [{ type: "text", text: CODEBUDDY_CN_NEUTRAL_PROMPT }] };
+  }
+}
+
 /**
- * Tencent CodeBuddy Executor (codebuddy-cn / codebuddy-intl)
- * Uses OpenAI-compatible chat completions API with CodeBuddy CLI channel headers.
+ * The upstream blocks any request whose message text quotes its own error code
+ * `11128` — a tool result echoing an error page is enough to get refused.
+ */
+function rewriteBlockedCode(messages) {
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    for (const field of ["content", "reasoning_content"]) {
+      const value = message[field];
+      if (typeof value === "string") {
+        if (value.includes("11128")) message[field] = value.split("11128").join("11-128");
+      } else if (Array.isArray(value)) {
+        for (const part of value) {
+          if (part && typeof part === "object" && typeof part.text === "string" && part.text.includes("11128")) {
+            part.text = part.text.split("11128").join("11-128");
+          }
+        }
+      }
+    }
+    if (Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        const fn = call && typeof call === "object" ? call.function : null;
+        if (fn && typeof fn.arguments === "string" && fn.arguments.includes("11128")) {
+          fn.arguments = fn.arguments.split("11128").join("11-128");
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Tencent CodeBuddy Executor (codebuddy-cn / codebuddy-intl).
+ *
+ * Chat wire contract follows risunCodex/Cartethyia: force stream, fixed leading
+ * system prompt, the conversation/tracing header family, and the CLI identity
+ * envelope. Only three headers are mandatory upstream
+ * (`x-conversation-id`, `x-conversation-request-id`,
+ * `x-conversation-message-id`); the rest are sent because a real client sends
+ * them.
  */
 export class CodeBuddyExecutor extends DefaultExecutor {
   constructor(provider = "codebuddy-cn") {
@@ -69,12 +140,15 @@ export class CodeBuddyExecutor extends DefaultExecutor {
   buildHeaders(credentials, stream = true, url, model, transformedBody) {
     const headers = super.buildHeaders(credentials, true);
     const rawHeaders = credentials?.rawHeaders || {};
+    const isCn = this.provider === "codebuddy-cn";
 
     const domain =
       credentials?.providerSpecificData?.domain ||
-      (this.provider === "codebuddy-cn" ? "copilot.tencent.com" : "www.codebuddy.ai");
+      (isCn ? "copilot.tencent.com" : "www.codebuddy.ai");
 
-    // 1. Resolve conversation ID (inbound header > body > sessionResolver > UUID)
+    // Conversation-scoped id: inbound header, then body hint, then the existing
+    // session resolver. A blank or absent value is generated inside
+    // buddyConversationHeaders — withholding the header guarantees a refusal.
     const headerConvId = getHeaderCaseInsensitive(rawHeaders, "x-conversation-id");
     const bodyConvId =
       transformedBody?.conversation_id ||
@@ -82,79 +156,59 @@ export class CodeBuddyExecutor extends DefaultExecutor {
       transformedBody?.metadata?.conversation_id ||
       transformedBody?.metadata?.session_id;
 
-    let convId = headerConvId || bodyConvId;
-    if (!convId) {
+    let conversationId = headerConvId || bodyConvId;
+    if (!conversationId) {
       try {
-        convId = resolveSessionId({
+        conversationId = resolveSessionId({
           headers: rawHeaders,
           body: transformedBody,
           connectionId: credentials?.connectionId,
           scope: this.provider,
         });
       } catch {
-        convId = null;
+        conversationId = undefined;
       }
     }
-    if (!convId) {
-      convId = crypto.randomUUID();
-    }
 
-    // 2. Request & Turn IDs
     const inboundReqId =
       getHeaderCaseInsensitive(rawHeaders, "x-conversation-request-id") ||
       getHeaderCaseInsensitive(rawHeaders, "x-root-request-id");
-    const convReqId = inboundReqId ? inboundReqId.trim() : crypto.randomUUID();
-    const convMsgId = crypto.randomUUID();
-    const reqId = convMsgId.replace(/-/g, "");
-
-    // 3. Distributed tracing headers
     const inboundTraceId = getHeaderCaseInsensitive(rawHeaders, "x-trace-id");
-    const traceId = inboundTraceId ? inboundTraceId.trim() : convReqId;
 
-    const inboundB3Trace = getHeaderCaseInsensitive(rawHeaders, "x-b3-traceid");
-    const b3TraceId = isValidB3TraceId(inboundB3Trace)
-      ? inboundB3Trace.trim().toLowerCase()
-      : crypto.randomBytes(16).toString("hex");
+    const conversation = buddyConversationHeaders({
+      ...(conversationId ? { conversationId } : {}),
+      ...(inboundReqId ? { conversationRequestId: inboundReqId } : {}),
+      ...(inboundTraceId ? { traceId: inboundTraceId } : {}),
+    });
 
-    const b3SpanId = crypto.randomBytes(8).toString("hex");
+    // Inbound B3 sampled=0 is preserved; the helper always emits "1".
+    const inboundSampled = getHeaderCaseInsensitive(rawHeaders, "x-b3-sampled");
+    if (inboundSampled === "0") conversation["x-b3-sampled"] = "0";
 
-    const inboundB3Sampled = getHeaderCaseInsensitive(rawHeaders, "x-b3-sampled");
-    const b3Sampled = inboundB3Sampled === "0" ? "0" : "1";
+    const userId =
+      credentials?.providerSpecificData?.userId ||
+      credentials?.userId ||
+      credentials?.email ||
+      "anonymous";
 
+    // Browser transport headers belong to the desktop identity only; the CLI
+    // branch drops them so a request never carries both halves.
     delete headers["x-requested-with"];
     delete headers["x-codebuddy-request"];
 
     Object.assign(headers, {
       "Content-Type": "application/json; charset=utf-8",
-      "User-Agent": "CLI/2.108.1 CodeBuddy/2.108.1",
+      accept: "application/json",
+      "User-Agent": `CLI/${CODEBUDDY_VERSION} CodeBuddy/${CODEBUDDY_VERSION}`,
       "X-Product": "SaaS",
-      "X-App": "cli",
       "X-IDE-Type": "CLI",
       "X-IDE-Name": "CLI",
-      "X-IDE-Version": "2.108.1",
-      "X-Private-Data": "false",
-      "X-Requested-With": "XMLHttpRequest",
-      "X-CodeBuddy-Request": "1",
+      "X-IDE-Version": CODEBUDDY_VERSION,
       "X-Domain": domain,
-      "X-Stainless-Runtime": "node",
-      "X-Stainless-Runtime-Version": process.version || "v24.11.1",
-      "X-Stainless-Lang": "js",
-      "X-Stainless-Arch": "x64",
-      "X-Stainless-Os": "Windows",
-      "X-Stainless-Package-Version": "6.25.0",
-      "X-Stainless-Helper-Method": "stream",
-      "X-Stainless-Retry-Count": "0",
-      "X-Request-ID": reqId,
-      "X-Conversation-ID": convId,
-      "X-Conversation-Request-ID": convReqId,
-      "X-Conversation-Message-ID": convMsgId,
-      "X-Root-Request-ID": convReqId,
-      "X-Trace-ID": traceId,
-      "X-B3-TraceId": b3TraceId,
-      "X-B3-SpanId": b3SpanId,
-      "X-B3-Sampled": b3Sampled,
-      "X-Agent-Intent": "craft",
       "X-Agent-Purpose": "conversation",
+      ...conversation,
+      ...buddyCliTraceHeaders(conversation),
+      ...buddyCliHeaders({ userId }),
     });
 
     return headers;
@@ -162,7 +216,7 @@ export class CodeBuddyExecutor extends DefaultExecutor {
 
   transformRequest(model, body, stream, credentials) {
     const nextBody = super.transformRequest(model, body, stream, credentials);
-    nextBody.stream = true;
+    const isCn = this.provider === "codebuddy-cn";
 
     // Remap retired/deprecated model IDs to active successors
     if (nextBody.model && CODEBUDDY_RETIRED_MODEL_MAP[nextBody.model]) {
@@ -171,56 +225,26 @@ export class CodeBuddyExecutor extends DefaultExecutor {
       nextBody.model = CODEBUDDY_RETIRED_MODEL_MAP[model];
     }
 
-    const effort = nextBody.reasoning_effort;
-    if (effort === "none" || effort === "off") {
-      delete nextBody.reasoning_effort;
-    } else if (effort) {
-      nextBody.reasoning_summary = "auto";
+    if (isCn) {
+      // CN: neutralize flagged agent prompts, keep legitimate caller system
+      // turns, then run the shared envelope tail.
+      buddyPrePayloadCommon(nextBody, CODEBUDDY_CN_NEUTRAL_PROMPT);
+      if (Array.isArray(nextBody.messages)) {
+        neutralizeCnMessages(nextBody.messages);
+        coalesceConsecutiveUserMessages(nextBody.messages);
+        dropEmptyBuddyMessages(nextBody.messages);
+        ensureBuddyLeadingSystem(nextBody.messages, CODEBUDDY_CN_NEUTRAL_PROMPT);
+      }
+    } else {
+      // Intl: the fixed leading prompt is a wire contract — caller
+      // system/developer turns are dropped, not merged into it.
+      buddyPrePayloadCommon(nextBody, CODEBUDDY_SYSTEM_PROMPT, { dropSystem: true });
+      if (Array.isArray(nextBody.messages)) {
+        applyBuddySystemPrompt(nextBody.messages, CODEBUDDY_SYSTEM_PROMPT);
+      }
     }
 
-    const inputMessages = Array.isArray(nextBody.messages) ? nextBody.messages : [];
-    const systemParts = [CODEBUDDY_SYSTEM_PROMPT];
-    const otherMessages = [];
-
-    for (const m of inputMessages) {
-      if (!m || typeof m !== "object") continue;
-      if (m.role === "system" || m.role === "developer") {
-        const rawText =
-          typeof m.content === "string"
-            ? m.content
-            : Array.isArray(m.content)
-              ? m.content
-                  .map((b) => (typeof b === "string" ? b : b && typeof b.text === "string" ? b.text : ""))
-                  .join("\n")
-              : "";
-        const cleaned = sanitizeChannelMarkers(rawText).trim();
-        if (cleaned && cleaned !== CODEBUDDY_SYSTEM_PROMPT) {
-          systemParts.push(cleaned);
-        }
-        continue;
-      }
-      if (m.role === "user" && typeof m.content === "string") {
-        otherMessages.push({ ...m, content: [{ type: "text", text: m.content }] });
-        continue;
-      }
-      if (m.role === "assistant") {
-        const nextMsg = { ...m };
-        if (typeof nextMsg.content === "string") {
-          nextMsg.content = sanitizeChannelMarkers(nextMsg.content);
-        } else if (Array.isArray(nextMsg.content)) {
-          nextMsg.content = nextMsg.content.map((b) =>
-            b && typeof b === "object" && typeof b.text === "string"
-              ? { ...b, text: sanitizeChannelMarkers(b.text) }
-              : b
-          );
-        }
-        otherMessages.push(nextMsg);
-        continue;
-      }
-      otherMessages.push({ ...m });
-    }
-
-    nextBody.messages = [{ role: "system", content: systemParts.join("\n\n") }, ...otherMessages];
+    if (Array.isArray(nextBody.messages)) rewriteBlockedCode(nextBody.messages);
     return nextBody;
   }
 
@@ -229,10 +253,24 @@ export class CodeBuddyExecutor extends DefaultExecutor {
       try {
         const parsed = JSON.parse(bodyText);
         const msg = parsed?.msg || parsed?.message || parsed?.error?.message || "";
+        if (parsed?.code === 11128) {
+          return {
+            status: 400,
+            message:
+              "CodeBuddy channel verification failed (11128): the conversation header family or the leading system turn was rejected. " +
+              String(msg).slice(0, 200),
+          };
+        }
         if (parsed?.code === 11102) {
           return {
             status: 400,
             message: `CodeBuddy model unavailable (11102): ${msg}. Please switch to an active model: hy3, hy4-preview, glm-5.3, glm-5.3-flash, glm-5.2, deepseek-v4.1-flash, kimi-k2.8-preview, or claude-opus-4.7-1m.`,
+          };
+        }
+        if (parsed?.code === 11158) {
+          return {
+            status: 403,
+            message: `CodeBuddy model not allowed for this account tier (11158): ${String(msg).slice(0, 200)}`,
           };
         }
         if (parsed?.code === 6004 || /超出频率限制|frequency limit|限额/i.test(msg)) {
@@ -277,4 +315,3 @@ export class CodeBuddyExecutor extends DefaultExecutor {
 }
 
 export default CodeBuddyExecutor;
-

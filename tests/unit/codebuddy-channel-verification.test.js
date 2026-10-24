@@ -1,88 +1,114 @@
 import { describe, it, expect } from "vitest";
 import { CodeBuddyExecutor } from "../../open-sse/executors/codebuddy-cn.js";
 import { CodeBuddyIntlExecutor } from "../../open-sse/executors/codebuddy-intl.js";
+import { buddyConversationHeaders } from "../../open-sse/shared/buddy/buddy-conversation-headers.js";
+
+const REQUIRED_CONVERSATION_HEADERS = [
+  "x-conversation-id",
+  "x-conversation-request-id",
+  "x-conversation-message-id",
+];
+
+describe("buddy conversation headers (Cartethyia contract)", () => {
+  it("always emits the three mandatory headers, even with no caller ids", () => {
+    const headers = buddyConversationHeaders();
+    for (const name of REQUIRED_CONVERSATION_HEADERS) {
+      expect(headers[name]).toBeTruthy();
+    }
+  });
+
+  it("honours a caller-supplied conversation id", () => {
+    const headers = buddyConversationHeaders({ conversationId: "conv-from-caller" });
+    expect(headers["x-conversation-id"]).toBe("conv-from-caller");
+    for (const name of REQUIRED_CONVERSATION_HEADERS) {
+      expect(headers[name]).toBeTruthy();
+    }
+  });
+
+  it("never forwards a blank conversation id", () => {
+    const headers = buddyConversationHeaders({ conversationId: "   " });
+    expect(headers["x-conversation-id"].trim().length).toBeGreaterThan(0);
+  });
+
+  it("keeps the request id conversation-scoped and the message id per message", () => {
+    const headers = buddyConversationHeaders();
+    expect(headers["x-root-request-id"]).toBe(headers["x-conversation-request-id"]);
+    expect(headers["x-request-id"]).toBe(headers["x-conversation-message-id"]);
+    expect(headers["x-conversation-request-id"]).not.toBe(headers["x-conversation-message-id"]);
+  });
+
+  it("keeps B3 ids hex even when the caller id is not", () => {
+    const headers = buddyConversationHeaders({ conversationId: "not-a-hex-id-with-dashes" });
+    expect(headers["x-b3-traceid"]).toMatch(/^[0-9a-f]{32}$/);
+    expect(headers["x-b3-spanid"]).toMatch(/^[0-9a-f]{16}$/);
+  });
+});
 
 describe("CodeBuddy channel verification (error 11128)", () => {
-  it("sets required CLI, Stainless, conversation, and tracing headers on codebuddy-cn and codebuddy-intl", () => {
+  it("sends the CLI identity envelope and conversation family on both providers", () => {
     const cnExec = new CodeBuddyExecutor();
     const intlExec = new CodeBuddyIntlExecutor();
 
     const cnHeaders = cnExec.buildHeaders({ accessToken: "tok-cn" }, true);
     const intlHeaders = intlExec.buildHeaders({ accessToken: "tok-intl" }, true);
 
-    expect(cnHeaders["User-Agent"]).toBe("CLI/2.108.1 CodeBuddy/2.108.1");
-    expect(cnHeaders["X-App"]).toBe("cli");
+    expect(cnHeaders["User-Agent"]).toBe("CLI/2.169.0 CodeBuddy/2.169.0");
     expect(cnHeaders["X-IDE-Type"]).toBe("CLI");
     expect(cnHeaders["X-IDE-Name"]).toBe("CLI");
-    expect(cnHeaders["X-IDE-Version"]).toBe("2.108.1");
     expect(cnHeaders["X-Domain"]).toBe("copilot.tencent.com");
-    expect(cnHeaders["X-Stainless-Lang"]).toBe("js");
-    expect(cnHeaders["X-Request-ID"]).toMatch(/^[0-9a-f]{32}$/);
-    expect(cnHeaders["X-Conversation-ID"]).toBeTruthy();
-    expect(cnHeaders["X-Conversation-Request-ID"]).toBeTruthy();
-    expect(cnHeaders["X-Conversation-Message-ID"]).toBeTruthy();
-    expect(cnHeaders["X-Root-Request-ID"]).toBe(cnHeaders["X-Conversation-Request-ID"]);
-    expect(cnHeaders["X-Trace-ID"]).toBe(cnHeaders["X-Conversation-Request-ID"]);
-    expect(cnHeaders["X-B3-TraceId"]).toMatch(/^[0-9a-f]{32}$/);
-    expect(cnHeaders["X-B3-SpanId"]).toMatch(/^[0-9a-f]{16}$/);
-    expect(cnHeaders["X-B3-Sampled"]).toBe("1");
     expect(cnHeaders["X-Agent-Intent"]).toBe("craft");
+    expect(cnHeaders["X-Agent-Runtime"]).toBe("other");
     expect(cnHeaders["X-Agent-Purpose"]).toBe("conversation");
+    expect(cnHeaders["x-stainless-lang"]).toBe("js");
+    expect(cnHeaders["x-stainless-package-version"]).toBe("6.25.0");
 
-    expect(intlHeaders["User-Agent"]).toBe("CLI/2.108.1 CodeBuddy/2.108.1");
+    // The three mandatory headers, on both variants.
+    for (const name of REQUIRED_CONVERSATION_HEADERS) {
+      expect(cnHeaders[name]).toBeTruthy();
+      expect(intlHeaders[name]).toBeTruthy();
+    }
+
+    // Browser-transport half must be absent from the CLI identity.
+    expect(cnHeaders["x-requested-with"]).toBeUndefined();
+    expect(cnHeaders["x-codebuddy-request"]).toBeUndefined();
+    expect(intlHeaders["x-requested-with"]).toBeUndefined();
+    expect(intlHeaders["x-codebuddy-request"]).toBeUndefined();
+
     expect(intlHeaders["X-Domain"]).toBe("www.codebuddy.ai");
-    expect(intlHeaders["X-Request-ID"]).toMatch(/^[0-9a-f]{32}$/);
-    expect(intlHeaders["X-Conversation-ID"]).toBeTruthy();
-    expect(intlHeaders["X-B3-TraceId"]).toMatch(/^[0-9a-f]{32}$/);
+    expect(intlHeaders["x-b3-traceid"]).toMatch(/^[0-9a-f]{32}$/);
   });
 
-  it("prioritizes inbound X-Conversation-ID and respects inbound B3 headers", () => {
+  it("passes inbound conversation ids through and preserves sampled=0", () => {
     const intlExec = new CodeBuddyIntlExecutor();
     const inboundHeaders = {
       "x-conversation-id": "client-conv-1234",
       "x-conversation-request-id": "client-req-5678",
       "x-trace-id": "client-trace-9999",
-      "x-b3-traceid": "463ac35c9f6413ad48485a3953bb6124",
       "x-b3-sampled": "0",
     };
 
-    const headers = intlExec.buildHeaders({
-      accessToken: "tok-intl",
-      rawHeaders: inboundHeaders,
-    }, true);
+    const headers = intlExec.buildHeaders(
+      { accessToken: "tok-intl", rawHeaders: inboundHeaders },
+      true
+    );
 
-    expect(headers["X-Conversation-ID"]).toBe("client-conv-1234");
-    expect(headers["X-Conversation-Request-ID"]).toBe("client-req-5678");
-    expect(headers["X-Root-Request-ID"]).toBe("client-req-5678");
-    expect(headers["X-Trace-ID"]).toBe("client-trace-9999");
-    expect(headers["X-B3-TraceId"]).toBe("463ac35c9f6413ad48485a3953bb6124");
-    expect(headers["X-B3-Sampled"]).toBe("0");
-    expect(headers["X-B3-SpanId"]).toMatch(/^[0-9a-f]{16}$/);
+    expect(headers["x-conversation-id"]).toBe("client-conv-1234");
+    expect(headers["x-conversation-request-id"]).toBe("client-req-5678");
+    expect(headers["x-root-request-id"]).toBe("client-req-5678");
+    expect(headers["x-trace-id"]).toBe("client-trace-9999");
+    expect(headers["x-b3-sampled"]).toBe("0");
+    expect(headers["x-b3-spanid"]).toMatch(/^[0-9a-f]{16}$/);
   });
 
-  it("prepends 'You are CodeBuddy Code.', preserves caller system/developer instructions, and sanitizes external client markers", () => {
+  it("installs the fixed leading system prompt and drops caller system/developer turns", () => {
     const intlExec = new CodeBuddyIntlExecutor();
     const out = intlExec.transformRequest(
       "glm-5.2",
       {
         messages: [
-          {
-            role: "system",
-            content:
-              "You are Claude Code, Anthropic's official CLI for Claude.\nAlways reply in JSON.",
-          },
-          {
-            role: "developer",
-            content: "Follow strict schema rules.",
-          },
-          {
-            role: "user",
-            content: "hello",
-          },
-          {
-            role: "assistant",
-            content: "I am running with cc_entrypoint=cli",
-          },
+          { role: "system", content: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { role: "developer", content: "Follow strict schema rules." },
+          { role: "user", content: "hello" },
         ],
       },
       true,
@@ -90,17 +116,59 @@ describe("CodeBuddy channel verification (error 11128)", () => {
     );
 
     expect(out.messages[0].role).toBe("system");
-    expect(out.messages[0].content.startsWith("You are CodeBuddy Code.")).toBe(true);
-    expect(out.messages[0].content).toContain("Always reply in JSON.");
-    expect(out.messages[0].content).toContain("Follow strict schema rules.");
-    expect(out.messages[0].content).not.toContain("You are Claude Code");
+    expect(out.messages[0].content).toContain("pragmatic and direct software engineering assistant");
+    // Caller identity text must not survive anywhere on the wire.
+    expect(JSON.stringify(out.messages)).not.toContain("You are Claude Code");
+    expect(JSON.stringify(out.messages)).not.toContain("Follow strict schema rules");
+    expect(out.messages[1]).toEqual({ role: "user", content: [{ type: "text", text: "hello" }] });
+  });
 
-    expect(out.messages[1]).toEqual({
-      role: "user",
-      content: [{ type: "text", text: "hello" }],
-    });
-    expect(out.messages[2].content).not.toContain("cc_entrypoint=cli");
-    expect(out.messages[2].content).toContain("[external-client-identity]");
+  it("coalesces consecutive user turns so images survive the upstream merge", () => {
+    const intlExec = new CodeBuddyIntlExecutor();
+    const out = intlExec.transformRequest(
+      "glm-5.2",
+      {
+        messages: [
+          { role: "user", content: "first" },
+          { role: "user", content: "second" },
+        ],
+      },
+      true,
+      {}
+    );
+
+    const users = out.messages.filter((m) => m.role === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0].content).toHaveLength(2);
+  });
+
+  it("forces stream and rewrites tool_choice objects to the wire string", () => {
+    const intlExec = new CodeBuddyIntlExecutor();
+    const out = intlExec.transformRequest(
+      "glm-5.2",
+      {
+        stream: false,
+        tool_choice: { type: "function", function: { name: "my_tool" } },
+        messages: [{ role: "user", content: "hi" }],
+      },
+      false,
+      {}
+    );
+
+    expect(out.stream).toBe(true);
+    expect(out.tool_choice).toBe("my_tool");
+  });
+
+  it("rewrites a quoted 11128 in message text so the upstream does not self-block", () => {
+    const intlExec = new CodeBuddyIntlExecutor();
+    const out = intlExec.transformRequest(
+      "glm-5.2",
+      { messages: [{ role: "user", content: "error code 11128 from upstream" }] },
+      true,
+      {}
+    );
+    expect(JSON.stringify(out.messages)).not.toContain("11128");
+    expect(JSON.stringify(out.messages)).toContain("11-128");
   });
 
   it.each([
@@ -113,18 +181,37 @@ describe("CodeBuddy channel verification (error 11128)", () => {
     ["deepseek-v4-pro", "deepseek-v4.1-flash"],
   ])("automatically remaps retired model '%s' to active successor '%s'", (retired, successor) => {
     const intlExec = new CodeBuddyIntlExecutor();
-    const out = intlExec.transformRequest(retired, { model: retired, messages: [{ role: "user", content: "test" }] }, true, {});
+    const out = intlExec.transformRequest(
+      retired,
+      { model: retired, messages: [{ role: "user", content: "test" }] },
+      true,
+      {}
+    );
     expect(out.model).toBe(successor);
   });
 
-  it("formats 11102 model service info not found into a diagnostic error", () => {
+  it("classifies 11102, 11128, and 11158 with distinct diagnostics", () => {
     const intlExec = new CodeBuddyIntlExecutor();
-    const err = intlExec.parseError(
+
+    const notServed = intlExec.parseError(
       { status: 400 },
       JSON.stringify({ code: 11102, msg: "model [hy3-preview] service info not found" })
     );
-    expect(err.status).toBe(400);
-    expect(err.message).toContain("11102");
-    expect(err.message).toContain("hy3");
+    expect(notServed.status).toBe(400);
+    expect(notServed.message).toContain("11102");
+
+    const channel = intlExec.parseError(
+      { status: 400 },
+      JSON.stringify({ code: 11128, msg: "request illegal" })
+    );
+    expect(channel.status).toBe(400);
+    expect(channel.message).toContain("channel verification");
+
+    const tier = intlExec.parseError(
+      { status: 400 },
+      JSON.stringify({ code: 11158, msg: "model [gpt-5.5] is not allowed for user type [personal_free_user]" })
+    );
+    expect(tier.status).toBe(403);
+    expect(tier.message).toContain("tier");
   });
 });
