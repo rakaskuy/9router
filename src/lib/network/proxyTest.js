@@ -25,6 +25,53 @@ function normalizeString(value) {
   return String(value).trim();
 }
 
+let _socksAgentPromise = null;
+
+async function createSocksAgent(proxyUrl) {
+  if (!_socksAgentPromise) {
+    _socksAgentPromise = import("socks-proxy-agent")
+      .then((m) => m.SocksProxyAgent || m.default?.SocksProxyAgent || m.default)
+      .catch((e) => {
+        console.warn(`[proxyTest] socks-proxy-agent unavailable: ${e?.message || e}`);
+        return null;
+      });
+  }
+  const SocksProxyAgent = await _socksAgentPromise;
+  if (!SocksProxyAgent) throw new Error("socks-proxy-agent unavailable");
+  return new SocksProxyAgent(proxyUrl);
+}
+
+/** Minimal HEAD probe over a node Agent (SOCKS), shaped like a fetch Response. */
+function socksHeadRequest(url, agent, signal) {
+  return import("node:url").then(({ URL: NodeURL }) => {
+    const parsed = new NodeURL(url);
+    const protoMod = parsed.protocol === "http:" ? import("node:http") : import("node:https");
+    return protoMod.then((mod) => {
+      const lib = mod.default ?? mod;
+      return new Promise((resolve, reject) => {
+        const req = lib.request(
+          parsed,
+          { method: "HEAD", agent, headers: { "User-Agent": "9Router" } },
+          (res) => {
+            res.resume();
+            resolve({
+              ok: (res.statusCode || 500) >= 200 && (res.statusCode || 500) < 400,
+              status: res.statusCode || 500,
+              statusText: res.statusMessage || "",
+            });
+          },
+        );
+        if (signal) {
+          if (signal.aborted) req.destroy(new Error("aborted"));
+          else signal.addEventListener("abort", () => req.destroy(new Error("aborted")), { once: true });
+        }
+        req.on("error", reject);
+        req.end();
+      });
+    });
+  });
+}
+
 export async function testProxyUrl({ proxyUrl, testUrl, timeoutMs } = {}) {
   const normalizedProxyUrl = normalizeString(proxyUrl);
   if (!normalizedProxyUrl) {
@@ -41,8 +88,14 @@ export async function testProxyUrl({ proxyUrl, testUrl, timeoutMs } = {}) {
   let dispatcher;
 
   try {
+    const isSocks = /^socks(4|4a|5|5h)?:/i.test(normalizedProxyUrl);
+
     try {
-      dispatcher = new ProxyAgent({ uri: normalizedProxyUrl });
+      // undici's ProxyAgent accepts a socks5:// URI and then fails at connect
+      // time, so a SOCKS pool would always report "error" without this branch.
+      dispatcher = isSocks
+        ? await createSocksAgent(normalizedProxyUrl)
+        : new ProxyAgent({ uri: normalizedProxyUrl });
     } catch (err) {
       return {
         ok: false,
@@ -56,17 +109,21 @@ export async function testProxyUrl({ proxyUrl, testUrl, timeoutMs } = {}) {
     const timer = setTimeout(() => controller.abort(), normalizedTimeoutMs);
 
     try {
-      const res = await undiciFetch(normalizedTestUrl, {
-        method: "HEAD",
-        dispatcher,
-        signal: controller.signal,
-        headers: {
-          "User-Agent": "9Router",
-        },
-      });
+      // socks-proxy-agent yields a node Agent, not an undici dispatcher, so the
+      // SOCKS branch goes through node:http(s) instead of undiciFetch.
+      const res = isSocks
+        ? await socksHeadRequest(normalizedTestUrl, dispatcher, controller.signal)
+        : await undiciFetch(normalizedTestUrl, {
+          method: "HEAD",
+          dispatcher,
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "9Router",
+          },
+        });
 
       return {
-        ok: res.ok,
+        ok: res.ok || (res.status >= 200 && res.status < 400),
         status: res.status,
         statusText: res.statusText,
         url: normalizedTestUrl,

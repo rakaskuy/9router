@@ -251,8 +251,79 @@ async function getDispatcher(proxyUrl, insecure = false) {
   return proxyDispatchers.get(key);
 }
 
+// ─── SOCKS support ────────────────────────────────────────────────────────
+// undici's ProxyAgent has no SOCKS implementation — it accepts a socks5:// URI
+// and then fails at connect time. Residential/mobile proxy networks ship SOCKS5
+// (usually authenticated) far more often than HTTP, so without this path a
+// pool entry pointing at one is silently unusable.
+let _socksAgentPromise = null;
+
+function isSocksProxyUrl(proxyUrl) {
+  return /^socks(4|4a|5|5h)?:/i.test(normalizeString(proxyUrl));
+}
+
+async function getSocksAgent(proxyUrl) {
+  if (!_socksAgentPromise) {
+    _socksAgentPromise = import("socks-proxy-agent")
+      .then((m) => m.SocksProxyAgent || m.default?.SocksProxyAgent || m.default)
+      .catch((e) => {
+        console.warn(`[ProxyFetch] socks-proxy-agent unavailable: ${e?.message || e}`);
+        return null;
+      });
+  }
+  const SocksProxyAgent = await _socksAgentPromise;
+  if (!SocksProxyAgent) throw new Error("socks-proxy-agent unavailable");
+  return new SocksProxyAgent(proxyUrl);
+}
+
+/**
+ * fetch-compatible request over a SOCKS proxy.
+ *
+ * Literal protocol specifiers on both branches — a fully dynamic import() is
+ * rejected by webpack, and the CLI bundle is built with it.
+ */
+async function socksFetch(url, options, proxyUrl) {
+  const agent = await getSocksAgent(proxyUrl);
+  const nodeUrl = new URL(url);
+  const protoMod = nodeUrl.protocol === "http:" ? await import("node:http") : await import("node:https");
+  const lib = protoMod.default ?? protoMod;
+
+  let headers = {};
+  const rawHeaders = options.headers;
+  if (rawHeaders instanceof Headers) for (const [k, v] of rawHeaders) headers[k] = v;
+  else if (rawHeaders) headers = { ...rawHeaders };
+
+  let body = options.body;
+  if (body && typeof body !== "string" && !Buffer.isBuffer(body)) body = Buffer.from(body);
+  if (body) headers["content-length"] = String(Buffer.byteLength(body));
+
+  return new Promise((resolve, reject) => {
+    const req = lib.request(
+      nodeUrl,
+      { method: options.method || "GET", agent, headers },
+      (res) => {
+        const outHeaders = new Headers();
+        for (const [k, v] of Object.entries(res.headers || {})) {
+          if (Array.isArray(v)) v.forEach((x) => outHeaders.append(k, String(x)));
+          else if (v != null) outHeaders.set(k, String(v));
+        }
+        resolve(new Response(Readable.toWeb(res), { status: res.statusCode || 200, headers: outHeaders }));
+      },
+    );
+    const signal = options.signal;
+    if (signal) {
+      if (signal.aborted) req.destroy(new Error("aborted"));
+      else signal.addEventListener("abort", () => req.destroy(new Error("aborted")), { once: true });
+    }
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
 async function fetchWithTlsFallback(url, options, proxyUrl) {
   try {
+    if (isSocksProxyUrl(proxyUrl)) return await socksFetch(url, options, proxyUrl);
     const dispatcher = proxyUrl ? await getDispatcher(proxyUrl) : undefined;
     return await originalFetch(url, dispatcher ? { ...options, dispatcher } : options);
   } catch (err) {
@@ -263,6 +334,10 @@ async function fetchWithTlsFallback(url, options, proxyUrl) {
       }
       // ponytail: in-memory insecure agent fallback for self-signed MITM corporate/antivirus certs
       console.warn(`[ProxyFetch] TLS cert verification failed (${err.cause?.code || err.code}), retrying with insecure TLS: ${url}`);
+      // The SOCKS agent has no separate insecure mode — the tunnel is opaque to
+      // us, so TLS is negotiated by the remote origin and a cert error there is
+      // not something this fallback can fix.
+      if (isSocksProxyUrl(proxyUrl)) throw err;
       const insecureDispatcher = await getDispatcher(proxyUrl, true);
       return await originalFetch(url, { ...options, dispatcher: insecureDispatcher });
     }

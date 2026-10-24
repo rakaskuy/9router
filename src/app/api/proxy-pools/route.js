@@ -7,7 +7,10 @@ function toBoolean(value) {
   return undefined;
 }
 
-const VALID_PROXY_TYPES = ["http", "vercel", "cloudflare", "deno", "netlify"];
+// `socks` is a direct tunnel (undici ProxyAgent has no SOCKS implementation, so
+// proxyFetch routes it through socks-proxy-agent). The relay types below rewrite
+// the request URL instead of tunnelling.
+const VALID_PROXY_TYPES = ["http", "socks", "vercel", "cloudflare", "deno", "netlify"];
 
 function normalizeProxyPoolInput(body = {}) {
   const name = typeof body?.name === "string" ? body.name.trim() : "";
