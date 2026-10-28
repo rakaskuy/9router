@@ -53,9 +53,15 @@ async function loadSession() {
       if (typeof wreq.createSession !== "function") {
         throw new Error("wreq-js runtime is missing createSession");
       }
-      return wreq.createSession({
-        emulation: { tlsOptions: { cipherList: OPENCODE_CIPHER_LIST } },
-      });
+      try {
+        return await wreq.createSession({
+          emulation: { tlsOptions: { cipherList: OPENCODE_CIPHER_LIST } },
+        });
+      } catch {
+        return await wreq.createSession({
+          profile: "chrome_131",
+        });
+      }
     })().catch((error) => {
       sessionPromise = null;
       throw error;
