@@ -68,6 +68,9 @@ function npmInstall(pkg, version) {
   });
 }
 
+// Prevent Webpack from statically intercepting external file URL imports
+const nativeImport = new Function("url", "return import(url)");
+
 const inflight = new Map();
 
 async function load(pkg) {
@@ -82,7 +85,7 @@ async function load(pkg) {
   const existingEntry = resolveRuntimeEntry(dir, pkg);
   if (existingEntry) {
     try {
-      const mod = await import(pathToFileURL(existingEntry).href);
+      const mod = await nativeImport(pathToFileURL(existingEntry).href);
       return mod.default ?? mod;
     } catch (error) {
       if (!isModuleMissing(error)) throw error;
@@ -100,7 +103,7 @@ async function load(pkg) {
   }
   const installedEntry = resolveRuntimeEntry(dir, pkg);
   if (installedEntry) {
-    const mod = await import(pathToFileURL(installedEntry).href);
+    const mod = await nativeImport(pathToFileURL(installedEntry).href);
     return mod.default ?? mod;
   }
   throw new Error(`Package ${pkg} was installed in ${dir} but no entrypoint could be resolved`);
