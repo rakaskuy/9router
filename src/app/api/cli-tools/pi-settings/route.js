@@ -165,8 +165,6 @@ export async function POST(request) {
       modelList = [withDefaults({ id: modelId })];
     }
 
-    const existingProvider = existing.providers["9router"] || {};
-
     existing.providers["9router"] = {
       ...existingProvider,
       baseUrl: normalizedBaseUrl,
