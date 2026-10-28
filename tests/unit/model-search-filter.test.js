@@ -151,5 +151,19 @@ describe("modelSearchFilter utility", () => {
       const result = filterModelsByQuery(sampleModels, "/gpt-4o-(mini)/i");
       expect(result.map((m) => m.id)).toEqual(["gpt-4o-mini"]);
     });
+
+    it.each([
+      ["/(?<!sonnet)claude/g", ["claude-opus", "claude-sonnet", "claude-haiku", "claude-4.5"]],
+      ["/^(?!.*haiku).*claude/g", ["claude-opus", "claude-sonnet", "claude-4.5"]],
+    ])("keeps global assertion search %s independent of item order and previous filters", (rawQuery, names) => {
+      const models = ["claude-opus", "claude-sonnet", "claude-haiku", "claude-4.5"]
+        .map((name) => ({ name, id: `anthropic/${name}` }));
+      const expected = models.filter((model) => names.includes(model.name));
+      const query = parseSearchQuery(rawQuery);
+
+      expect(filterModelsByQuery(models, query)).toEqual(expected);
+      expect(filterModelsByQuery(models, query)).toEqual(expected);
+      expect(filterModelsByQuery([...models].reverse(), query)).toEqual([...expected].reverse());
+    });
   });
 });
