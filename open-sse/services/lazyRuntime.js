@@ -11,7 +11,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { getWritableDataDir } from "../utils/writableDataDir.js";
 
@@ -28,6 +27,31 @@ function getRuntimeDir() {
 function isModuleMissing(error) {
   const code = String(error?.code || "");
   return code === "MODULE_NOT_FOUND" || code === "ERR_MODULE_NOT_FOUND";
+}
+
+function resolveRuntimeEntry(dir, pkg) {
+  const pkgDir = path.join(dir, "node_modules", pkg);
+  const pkgJsonPath = path.join(pkgDir, "package.json");
+  if (!fs.existsSync(pkgJsonPath)) return null;
+  try {
+    const raw = fs.readFileSync(pkgJsonPath, "utf8");
+    const json = JSON.parse(raw);
+    let target = json.main || json.module || "index.js";
+    if (typeof json.exports === "string") {
+      target = json.exports;
+    } else if (json.exports && typeof json.exports === "object") {
+      const dot = json.exports["."];
+      if (typeof dot === "string") target = dot;
+      else if (dot && typeof dot === "object") {
+        target = dot.import || dot.require || dot.default || target;
+      }
+    }
+    const entry = path.join(pkgDir, target);
+    if (fs.existsSync(entry)) return entry;
+    const indexFallback = path.join(pkgDir, "index.js");
+    if (fs.existsSync(indexFallback)) return indexFallback;
+  } catch {}
+  return null;
 }
 
 function npmInstall(pkg, version) {
@@ -54,15 +78,18 @@ async function load(pkg) {
     if (!isModuleMissing(error)) throw error;
   }
   // 2) Already present in the runtime dir from a previous install.
-  const runtimeRequire = createRequire(path.join(getRuntimeDir(), "package.json"));
-  try {
-    return await import(pathToFileURL(runtimeRequire.resolve(pkg)).href);
-  } catch (error) {
-    if (!isModuleMissing(error)) throw error;
+  const dir = getRuntimeDir();
+  const existingEntry = resolveRuntimeEntry(dir, pkg);
+  if (existingEntry) {
+    try {
+      const mod = await import(pathToFileURL(existingEntry).href);
+      return mod.default ?? mod;
+    } catch (error) {
+      if (!isModuleMissing(error)) throw error;
+    }
   }
   // 3) Download on demand, then import from the runtime dir.
   const version = LAZY_DEP_VERSIONS[pkg] || "latest";
-  const dir = getRuntimeDir();
   const res = await npmInstall(pkg, version);
   if (!res.ok) {
     const reason = (res.stderr.match(/npm ERR! ?(.+)/) || [])[1] || res.stderr.split("\n").filter(Boolean).pop() || "unknown npm error";
@@ -71,7 +98,12 @@ async function load(pkg) {
       `install it manually: cd "${dir}" && npm install ${pkg}@${version}`
     );
   }
-  return import(pathToFileURL(createRequire(path.join(dir, "package.json")).resolve(pkg)).href);
+  const installedEntry = resolveRuntimeEntry(dir, pkg);
+  if (installedEntry) {
+    const mod = await import(pathToFileURL(installedEntry).href);
+    return mod.default ?? mod;
+  }
+  throw new Error(`Package ${pkg} was installed in ${dir} but no entrypoint could be resolved`);
 }
 
 export function loadRuntimeDep(pkg) {
